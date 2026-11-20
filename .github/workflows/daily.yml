@@ -1,0 +1,119 @@
+name: Daily job tracker
+
+on:
+  schedule:
+    - cron: '17 12 * * *'  # 09:17 in São Paulo
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: daily-job-tracker
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    outputs:
+      source_status: ${{ steps.collect.outputs.source_status }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+
+      - name: Run offline tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Restore history or initialize its branch on the first run
+        shell: bash
+        run: |
+          state="$RUNNER_TEMP/tracker-state"
+          mkdir -p data
+          if git ls-remote --exit-code origin refs/heads/tracker-state > /dev/null; then
+            git fetch --no-tags --depth=1 origin refs/heads/tracker-state
+            git worktree add -b tracker-state "$state" FETCH_HEAD
+            test -s "$state/jobs.sqlite3"
+            cp "$state/jobs.sqlite3" data/jobs.sqlite3
+          else
+            result=$?
+            if [[ "$result" != 2 ]]; then exit "$result"; fi
+            git worktree add --orphan -b tracker-state "$state"
+          fi
+
+      - name: Collect listings and render the digest
+        id: collect
+        shell: bash
+        run: |
+          result=0
+          python -m tracker refresh --db data/jobs.sqlite3 --output site/index.html || result=$?
+          case "$result" in
+            0) echo 'source_status=healthy' >> "$GITHUB_OUTPUT" ;;
+            1) echo 'source_status=degraded' >> "$GITHUB_OUTPUT"
+               echo '::warning::A source failed. The digest shows its last known state.' ;;
+            *) exit "$result" ;;
+          esac
+          test -s site/index.html
+          test -s data/jobs.sqlite3
+
+      - name: Persist history
+        shell: bash
+        run: |
+          state="$RUNNER_TEMP/tracker-state"
+          python - "$state/jobs.sqlite3" <<'PY'
+          import sqlite3
+          import sys
+          from contextlib import closing
+
+          with closing(sqlite3.connect("file:data/jobs.sqlite3?mode=ro", uri=True)) as source:
+              if source.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
+                  raise SystemExit("SQLite integrity check failed. Previous state preserved.")
+              with closing(sqlite3.connect(sys.argv[1])) as target:
+                  source.backup(target)
+          PY
+          git -C "$state" add -- jobs.sqlite3
+          if ! git -C "$state" diff --cached --quiet; then
+            git -C "$state" -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit -m "Refresh job history for run $GITHUB_RUN_ID"
+            git push origin refs/heads/tracker-state:refs/heads/tracker-state
+          fi
+
+      - name: Prepare the public page
+        run: |
+          mkdir "$RUNNER_TEMP/public"
+          cp site/index.html "$RUNNER_TEMP/public/index.html"
+
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: ${{ runner.temp }}/public
+
+  publish:
+    needs: refresh
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy the digest
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+  source-health:
+    needs: refresh
+    if: needs.refresh.outputs.source_status == 'degraded'
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Report failed feeds
+        run: |
+          echo '::error::At least one feed failed. Review the source status in the digest and re-run the workflow to retry.'
+          exit 1

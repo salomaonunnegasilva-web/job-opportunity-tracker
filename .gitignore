@@ -1,0 +1,6 @@
+# Local job history, user labels, generated reports and Python caches.
+/data/
+/site/
+.venv/
+__pycache__/
+*.py[cod]
